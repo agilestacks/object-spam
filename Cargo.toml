@@ -1,0 +1,17 @@
+[package]
+name = "object-spam"
+version = "0.1.0"
+authors = ["Rick Richardson <rick.richardson@gmail.com>"]
+
+[dependencies]
+serde_json = "1.0.33"
+serde_derive = "1.0.80"
+clap = "2.32.0"
+rusoto_s3 = "0.35.0"
+lazy_static = "1.2.0"
+human-size = "0.4.0"
+quantiles = "0.7.1"
+futures = "0.1.25"
+rusoto_core = "0.35.0"
+time = "0.1.40"
+tokio = "0.1.11"
