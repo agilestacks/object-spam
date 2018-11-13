@@ -2,7 +2,7 @@
 
 REPO=eigenrick
 IMAGE=object-spam
-TAG=0.1
+TAG=0.3
 
 SOURCEDIR=$(dirname ${BASH_SOURCE[0]})
 cd ${SOURCEDIR} && cd ..

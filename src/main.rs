@@ -16,12 +16,12 @@ use std::str;
 use std::iter;
 use std::sync::Arc;
 use time::get_time;
-use std::time::Duration;
+use std::time::{ Duration, Instant };
 use human_size::{SpecificSize, Byte, Megabyte};
-use quantiles::histogram::{Bound, Histogram};
+use quantiles::histogram::{Histogram};
 use clap::{Arg, ArgMatches, App};
 use tokio::runtime::Runtime;
-use futures::{Future, Stream, stream};
+use futures::{Future, Stream, stream, future};
 use rusoto_core::{ Region, ProvideAwsCredentials};
 use rusoto_core::credential::{ DefaultCredentialsProvider};
 use rusoto_s3::{S3, S3Client, GetObjectRequest,
@@ -116,6 +116,7 @@ fn main() {
     core.block_on(create_bucket(&*client.clone(), &*bench_bucket)).unwrap();
 
     println!("Working ...");
+    let start_write = Instant::now();
     // Write Payloads to bucket
     let c1 = client.clone();
     let writejobs = stream::iter_ok(1 .. *count).map(move |i| {
@@ -130,6 +131,7 @@ fn main() {
 
     // Read Payloads from bucket
     let c2 = client.clone();
+    let start_read = Instant::now();
     let readjobs = stream::iter_ok(1 .. *count).map(move |i| {
             fetch_payload(&*c2, &bench_bucket, &format!("test_{}", i), *size)
         })
@@ -144,6 +146,7 @@ fn main() {
     println!("Done! \nCleaning up ...");
   
     let c3 = client.clone();
+    let start_clean = Instant::now();
     let delstuff = stream::iter_ok(1 .. *count).map(move |i| {
         delete_payload(&*c3, &bench_bucket, &format!("test_{}", i))
     })
@@ -154,12 +157,20 @@ fn main() {
         .and_then(|_| Ok(())));
 
     core.block_on(delstuff).unwrap();
-   
+  
+    let end_time = Instant::now();
     core.shutdown_on_idle().wait().unwrap();
 
     println!("Stats");
     print_percentiles("Read", rtimings);
     print_percentiles("Write", wtimings);
+    let wtime = start_read.duration_since(start_write).as_secs();
+    let rtime = start_clean.duration_since(start_read).as_secs();
+    let total = end_time.duration_since(start_write).as_secs();
+    println!("");
+    println!("Write time {} s", wtime);
+    println!("Read time {} s", rtime);
+    println!("Total time {} s", total);
 }
 
 fn create_bucket(client: &S3Client, bucket: &str) -> impl Future<Item=(), Error=()> {
@@ -197,11 +208,11 @@ fn fetch_payload(client: &S3Client, bucket: &str, key: &str, bufsz: usize) -> im
         .get_object(get_req)
         .map_err(|e| e.to_string())
         .and_then(|resp| {
-            resp.body.unwrap().concat2().map_err(|e| e.to_string())
+            resp.body.unwrap().map_err(|e| format!("{}", e)).fold(0, |acc : usize, x : Vec<u8>| future::ok::<usize, String>(acc + x.len()))
         })
-        .and_then(move |v| { 
-            if v.len() == bufsz { Ok(()) } 
-            else { Err(format!("Original size was {} and fetched payload size is {}", bufsz,  v.len())) }
+        .and_then(move |len| { 
+            if len == bufsz { Ok(()) } 
+            else { Err(format!("Original size was {} and fetched payload size is {}", bufsz,  len)) }
         })
         .or_else(|e| Ok(println!("Error: {}", e)));
     DurationFuture::new(result)
@@ -238,15 +249,16 @@ fn print_percentiles(category: &str, samples: Vec<f64>) {
     for s in samples.iter() {
         hist.insert(*s);
     }
-
+    let result = hist.into_vec();
     println!("Timing results for {}", category);
     println!("Bandwidth = {:.3} MB/sec", mbytes / sum as f64);
     println!("Mean = {:.3}", fifty);
+    println!("Average = {:.3}", sum / samples.len() as f64);
     println!("Max = {:.3}", max);
     println!("Min = {:.3}", min);
-    println!("50th Percenile value = {:.3} | count = {}", fifty, hist.total_above(Bound::Finite(fifty)));
-    println!("70th Percenile value = {:.3} | count = {}", seventy, hist.total_above(Bound::Finite(seventy)));
-    println!("90th Percenile value = {:.3} | count = {}", ninety, hist.total_above(Bound::Finite(ninety)));
-    println!("95th Percenile value = {:.3} | count = {}", ninety5, hist.total_above(Bound::Finite(ninety5)));
-    println!("99th Percenile value = {:.3} | count = {}", ninety9, hist.total_above(Bound::Finite(ninety9)));
+    println!("50th Percenile value = {:.3} | count = {}", fifty, result[0].1);
+    println!("70th Percenile value = {:.3} | count = {}", seventy, result[1].1);
+    println!("90th Percenile value = {:.3} | count = {}", ninety, result[2].1);
+    println!("95th Percenile value = {:.3} | count = {}", ninety5, result[3].1);
+    println!("99th Percenile value = {:.3} | count = {}", ninety9, result[4].1);
 }
