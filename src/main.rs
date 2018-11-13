@@ -106,8 +106,12 @@ fn main() {
     let t = get_time();
     let bench_bucket = format!("object-spam-{}.{}", t.sec, t.nsec);
 
+    println!("Creating test bucket {}", &bench_bucket);
+    // Create bucket
     create_bucket(&client, &bench_bucket).wait().unwrap();
 
+    println!("Working ...");
+    // Write Payloads to bucket
     let writejobs = stream::iter_ok(1 .. *count).map(|i| {
         post_payload(&client, &bench_bucket, &format!("test_{}", i), &payload)
     })
@@ -117,6 +121,7 @@ fn main() {
         dur.as_secs() as f64 + (dur.subsec_micros() as f64 / 1_000_000_f64)
     }).collect().wait();
 
+    // Read Payloads from bucket
     let readjobs = stream::iter_ok(1 .. *count).map(|i| {
         fetch_payload(&client, &bench_bucket, &format!("test_{}", i), *size)
     })
@@ -125,11 +130,11 @@ fn main() {
     let rtimings = readjobs.map(|(_, dur)| { 
         dur.as_secs() as f64 + (dur.subsec_micros() as f64 / 1_000_000_f64)
     }).collect().wait();
-   
-    print_percentiles("Read", rtimings.unwrap());
-    print_percentiles("Write", wtimings.unwrap());
+  
 
-    println!("\n ... cleaning up ...");
+
+    // Delete up payloads and bucket
+    println!("Done! \nCleaning up ...");
     
     stream::iter_ok(1 .. *count).map(|i| {
         delete_payload(&client, &bench_bucket, &format!("test_{}", i))
@@ -137,6 +142,10 @@ fn main() {
     .buffered(*workers).for_each(|_| Ok(())).wait().unwrap();
 
     client.delete_bucket(DeleteBucketRequest { bucket: bench_bucket.clone(), ..Default::default() }).wait().unwrap();
+    
+    println!("Stats");
+    print_percentiles("Read", rtimings.unwrap());
+    print_percentiles("Write", wtimings.unwrap());
 }
 
 fn create_bucket(client: &S3Client, bucket: &str) -> impl Future<Item=(), Error=String> {
