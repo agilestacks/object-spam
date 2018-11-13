@@ -14,11 +14,13 @@ extern crate lazy_static;
 
 use std::str;
 use std::iter;
+use std::sync::Arc;
 use time::get_time;
 use std::time::Duration;
 use human_size::{SpecificSize, Byte};
 use quantiles::histogram::{Bound, Histogram};
 use clap::{Arg, ArgMatches, App};
+use tokio::runtime::Runtime;
 use futures::{Future, Stream, stream};
 use rusoto_core::{ Region, ProvideAwsCredentials};
 use rusoto_core::credential::{ DefaultCredentialsProvider};
@@ -30,7 +32,7 @@ use duration::DurationFuture;
 
 lazy_static! {
     static ref matches : ArgMatches<'static> = App::new("object-spam")
-                          .version("1.0")
+                          .version("0.1")
                           .author("Rick Richardson <rick@agilestacks.com>")
                           .about("Object Storage benchmarking tool")
                           .arg(Arg::with_name("size")
@@ -44,7 +46,7 @@ lazy_static! {
                                .help("Sets the desired number of parallel in-flight requests")
                                .short("p")
                                .long("parallel")
-                               .default_value("8")
+                               .default_value("3")
                                .takes_value(true))
                           .arg(Arg::with_name("count")
                                .short("c")
@@ -89,6 +91,10 @@ lazy_static! {
     static ref endpoint : &'static str = matches.value_of("endpoint").unwrap();
     static ref count : usize = matches.value_of("count").unwrap().parse().unwrap(); 
     static ref jsonout : bool = matches.is_present("json");
+    static ref bench_bucket : String = { 
+        let t = get_time();
+        format!("object-spam-{}.{}", t.sec, t.nsec)
+    };
 }
 
 fn main() {
@@ -100,59 +106,67 @@ fn main() {
             // the name doesn't matter at this point
             Region::Custom { name: "us-east-1".to_owned(), endpoint: endpoint.to_owned() }
         };
+    let client = Arc::new(S3Client::new(region.clone()));
+    let mut core = Runtime::new().unwrap();
 
-    let client = S3Client::new(region.clone());
     let _credentials = DefaultCredentialsProvider::new().unwrap().credentials().wait().unwrap();
-    let t = get_time();
-    let bench_bucket = format!("object-spam-{}.{}", t.sec, t.nsec);
 
-    println!("Creating test bucket {}", &bench_bucket);
+    println!("Creating test bucket {}", &*bench_bucket);
     // Create bucket
-    create_bucket(&client, &bench_bucket).wait().unwrap();
+    core.block_on(create_bucket(&*client.clone(), &*bench_bucket)).unwrap();
 
     println!("Working ...");
     // Write Payloads to bucket
-    let writejobs = stream::iter_ok(1 .. *count).map(|i| {
-        post_payload(&client, &bench_bucket, &format!("test_{}", i), &payload)
-    })
-    .buffered(*workers);
+    let c1 = client.clone();
+    let writejobs = stream::iter_ok(1 .. *count).map(move |i| {
+            post_payload(&*c1, &bench_bucket, &format!("test_{}", i), &payload)
+        })
+        .buffered(*workers)
+        .map(|(_, dur)| { 
+            dur.as_secs() as f64 + (dur.subsec_micros() as f64 / 1_000_000_f64)
+        }).collect();
 
-    let wtimings = writejobs.map(|(_, dur)| { 
-        dur.as_secs() as f64 + (dur.subsec_micros() as f64 / 1_000_000_f64)
-    }).collect().wait();
+    let wtimings = core.block_on(writejobs).unwrap();
 
     // Read Payloads from bucket
-    let readjobs = stream::iter_ok(1 .. *count).map(|i| {
-        fetch_payload(&client, &bench_bucket, &format!("test_{}", i), *size)
-    })
-    .buffered(*workers);
-
-    let rtimings = readjobs.map(|(_, dur)| { 
-        dur.as_secs() as f64 + (dur.subsec_micros() as f64 / 1_000_000_f64)
-    }).collect().wait();
+    let c2 = client.clone();
+    let readjobs = stream::iter_ok(1 .. *count).map(move |i| {
+            fetch_payload(&*c2, &bench_bucket, &format!("test_{}", i), *size)
+        })
+        .buffered(*workers)
+        .map(|(_, dur)| { 
+            dur.as_secs() as f64 + (dur.subsec_micros() as f64 / 1_000_000_f64)
+        }).collect();
   
-
+    let rtimings = core.block_on(readjobs).unwrap();
 
     // Delete up payloads and bucket
     println!("Done! \nCleaning up ...");
-    
-    stream::iter_ok(1 .. *count).map(|i| {
-        delete_payload(&client, &bench_bucket, &format!("test_{}", i))
+  
+    let c3 = client.clone();
+    let delstuff = stream::iter_ok(1 .. *count).map(move |i| {
+        delete_payload(&*c3, &bench_bucket, &format!("test_{}", i))
     })
-    .buffered(*workers).for_each(|_| Ok(())).wait().unwrap();
+    .buffered(*workers).for_each(|_| Ok(()))
+    .and_then(move |_| 
+        client.delete_bucket(DeleteBucketRequest { bucket: bench_bucket.clone(), ..Default::default() })
+        .map_err(|e| e.to_string())
+        .and_then(|_| Ok(())));
 
-    client.delete_bucket(DeleteBucketRequest { bucket: bench_bucket.clone(), ..Default::default() }).wait().unwrap();
-    
+    core.block_on(delstuff).unwrap();
+   
+    core.shutdown_on_idle().wait().unwrap();
+
     println!("Stats");
-    print_percentiles("Read", rtimings.unwrap());
-    print_percentiles("Write", wtimings.unwrap());
+    print_percentiles("Read", rtimings);
+    print_percentiles("Write", wtimings);
 }
 
-fn create_bucket(client: &S3Client, bucket: &str) -> impl Future<Item=(), Error=String> {
+fn create_bucket(client: &S3Client, bucket: &str) -> impl Future<Item=(), Error=()> {
     let create_bucket_req = CreateBucketRequest { bucket: bucket.to_owned(), ..Default::default() };
     client
         .create_bucket(create_bucket_req)
-        .map_err(|e| e.to_string())
+        .map_err(|e| println!("Failed to create bucket: {}", e.to_string()))
         .and_then(|_| Ok(()))
 }
 
@@ -166,7 +180,8 @@ fn post_payload(client: &S3Client, bucket: &str, key: &str, buffer: &Vec<u8>) ->
     let result = client
         .put_object(req)
         .map_err(|e| e.to_string())
-        .and_then(|_| Ok(()));
+        .and_then(|_| Ok(()))
+        .or_else(|e| Ok(println!("Error: {}", e)));
 
     DurationFuture::new(result)
 }
@@ -187,7 +202,8 @@ fn fetch_payload(client: &S3Client, bucket: &str, key: &str, bufsz: usize) -> im
         .and_then(move |v| { 
             if v.len() == bufsz { Ok(()) } 
             else { Err(format!("Original size was {} and fetched payload size is {}", bufsz,  v.len())) }
-        });
+        })
+        .or_else(|e| Ok(println!("Error: {}", e)));
     DurationFuture::new(result)
 }
 
