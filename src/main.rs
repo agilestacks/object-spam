@@ -17,7 +17,7 @@ use std::iter;
 use std::sync::Arc;
 use time::get_time;
 use std::time::Duration;
-use human_size::{SpecificSize, Byte};
+use human_size::{SpecificSize, Byte, Megabyte};
 use quantiles::histogram::{Bound, Histogram};
 use clap::{Arg, ArgMatches, App};
 use tokio::runtime::Runtime;
@@ -226,6 +226,9 @@ fn print_percentiles(category: &str, samples: Vec<f64>) {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let min = samples.first().unwrap();
     let max = samples.last().unwrap();
+    let sum : f64 = samples.iter().sum();
+    let bytes = SpecificSize::new(samples.len() as f64 * *size as f64, Byte).unwrap();
+    let mbytes = bytes.into::<Megabyte>().value();
     let fifty = max * 0.5;
     let seventy = max * 0.7; 
     let ninety = max * 0.9;
@@ -237,12 +240,13 @@ fn print_percentiles(category: &str, samples: Vec<f64>) {
     }
 
     println!("Timing results for {}", category);
-    println!("Mean = {}", fifty);
-    println!("Max = {}", max);
-    println!("Min = {}", min);
-    println!("50th Percenile value = {} | count = {}", fifty, hist.total_above(Bound::Finite(fifty)));
-    println!("70th Percenile value = {} | count = {}", seventy, hist.total_above(Bound::Finite(seventy)));
-    println!("90th Percenile value = {} | count = {}", ninety, hist.total_above(Bound::Finite(ninety)));
-    println!("95th Percenile value = {} | count = {}", ninety5, hist.total_above(Bound::Finite(ninety5)));
-    println!("99th Percenile value = {} | count = {}", ninety9, hist.total_above(Bound::Finite(ninety9)));
+    println!("Bandwidth = {:.3} MB/sec", mbytes / sum as f64);
+    println!("Mean = {:.3}", fifty);
+    println!("Max = {:.3}", max);
+    println!("Min = {:.3}", min);
+    println!("50th Percenile value = {:.3} | count = {}", fifty, hist.total_above(Bound::Finite(fifty)));
+    println!("70th Percenile value = {:.3} | count = {}", seventy, hist.total_above(Bound::Finite(seventy)));
+    println!("90th Percenile value = {:.3} | count = {}", ninety, hist.total_above(Bound::Finite(ninety)));
+    println!("95th Percenile value = {:.3} | count = {}", ninety5, hist.total_above(Bound::Finite(ninety5)));
+    println!("99th Percenile value = {:.3} | count = {}", ninety9, hist.total_above(Bound::Finite(ninety9)));
 }
