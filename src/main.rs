@@ -5,9 +5,13 @@ extern crate tokio;
 extern crate time;
 extern crate clap;
 extern crate human_size;
-extern crate quantiles;
+#[macro_use]
+extern crate serde_derive;
+extern crate serde_json;
+extern crate serde;
 
 mod duration;
+mod stats;
 
 #[macro_use]
 extern crate lazy_static;
@@ -17,8 +21,7 @@ use std::iter;
 use std::sync::Arc;
 use time::get_time;
 use std::time::{ Duration, Instant };
-use human_size::{SpecificSize, Byte, Megabyte};
-use quantiles::histogram::{Histogram};
+use human_size::{SpecificSize, Byte };
 use clap::{Arg, ArgMatches, App};
 use tokio::runtime::Runtime;
 use futures::{Future, Stream, stream, future};
@@ -29,6 +32,7 @@ use rusoto_s3::{S3, S3Client, GetObjectRequest,
                 CreateBucketRequest, DeleteBucketRequest };
 
 use duration::DurationFuture;
+use stats::Stats;
 
 lazy_static! {
     static ref matches : ArgMatches<'static> = App::new("object-spam")
@@ -111,11 +115,15 @@ fn main() {
 
     let _credentials = DefaultCredentialsProvider::new().unwrap().credentials().wait().unwrap();
 
-    println!("Creating test bucket {}", &*bench_bucket);
+    if !*jsonout {
+        println!("Creating test bucket {}", &*bench_bucket);
+    }
     // Create bucket
     core.block_on(create_bucket(&*client.clone(), &*bench_bucket)).unwrap();
 
-    println!("Working ...");
+    if !*jsonout {
+        println!("Working ...");
+    }
     let start_write = Instant::now();
     // Write Payloads to bucket
     let c1 = client.clone();
@@ -143,7 +151,9 @@ fn main() {
     let rtimings = core.block_on(readjobs).unwrap();
 
     // Delete up payloads and bucket
-    println!("Done! \nCleaning up ...");
+    if !*jsonout {
+        println!("Done! \nCleaning up ...");
+    }
   
     let c3 = client.clone();
     let start_clean = Instant::now();
@@ -160,17 +170,21 @@ fn main() {
   
     let end_time = Instant::now();
     core.shutdown_on_idle().wait().unwrap();
-
-    println!("Stats");
-    print_percentiles("Read", rtimings);
-    print_percentiles("Write", wtimings);
     let wtime = start_read.duration_since(start_write).as_secs();
     let rtime = start_clean.duration_since(start_read).as_secs();
     let total = end_time.duration_since(start_write).as_secs();
-    println!("");
-    println!("Write time {} s", wtime);
-    println!("Read time {} s", rtime);
-    println!("Total time {} s", total);
+
+    if *jsonout {
+        println!("{{ \"read\": {}, \n \"write\": {},", Stats::new("read", rtimings, *size).to_json(), Stats::new("write", wtimings, *size).to_json());
+        println!("\"read_time\": {}, \"write_time\": {}, \"total_time\": {} }}", rtime, wtime, total);
+    } else {
+        println!("-= Stats =-");
+        println!("{}", Stats::new("read", rtimings, *size));
+        println!("{}", Stats::new("write", wtimings, *size));
+        println!("Write time = {} s", wtime);
+        println!("Read time = {} s", rtime);
+        println!("Total time = {} s", total);
+    }
 }
 
 fn create_bucket(client: &S3Client, bucket: &str) -> impl Future<Item=(), Error=()> {
@@ -229,36 +243,3 @@ fn delete_payload(client: &S3Client, bucket: &str, key: &String) -> impl Future<
         .and_then(|_| Ok(()))
 }
 
-fn print_percentiles(category: &str, samples: Vec<f64>) {
-    if samples.is_empty() {
-        return;
-    }
-    let mut samples = samples.clone();
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let min = samples.first().unwrap();
-    let max = samples.last().unwrap();
-    let sum : f64 = samples.iter().sum();
-    let bytes = SpecificSize::new(samples.len() as f64 * *size as f64, Byte).unwrap();
-    let mbytes = bytes.into::<Megabyte>().value();
-    let fifty = max * 0.5;
-    let seventy = max * 0.7; 
-    let ninety = max * 0.9;
-    let ninety5 = max * 0.95;
-    let ninety9 = max * 0.99;
-    let mut hist = Histogram::new(vec![fifty, seventy, ninety, ninety5, ninety9]).unwrap();
-    for s in samples.iter() {
-        hist.insert(*s);
-    }
-    let result = hist.into_vec();
-    println!("Timing results for {}", category);
-    println!("Bandwidth = {:.3} MB/sec", mbytes / sum as f64);
-    println!("Mean = {:.3}", fifty);
-    println!("Average = {:.3}", sum / samples.len() as f64);
-    println!("Max = {:.3}", max);
-    println!("Min = {:.3}", min);
-    println!("50th Percenile value = {:.3} | count = {}", fifty, result[0].1);
-    println!("70th Percenile value = {:.3} | count = {}", seventy, result[1].1);
-    println!("90th Percenile value = {:.3} | count = {}", ninety, result[2].1);
-    println!("95th Percenile value = {:.3} | count = {}", ninety5, result[3].1);
-    println!("99th Percenile value = {:.3} | count = {}", ninety9, result[4].1);
-}
